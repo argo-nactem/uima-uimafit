@@ -23,6 +23,10 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.reflect.Modifier;
+import java.net.JarURLConnection;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
 
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang.exception.ExceptionUtils;
@@ -34,12 +38,19 @@ import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.plugins.annotations.ResolutionScope;
 import org.apache.maven.project.MavenProject;
+import org.apache.uima.analysis_engine.AnalysisEngineDescription;
+import org.apache.uima.collection.CollectionReaderDescription;
 import org.apache.uima.fit.factory.AnalysisEngineFactory;
 import org.apache.uima.fit.factory.CollectionReaderFactory;
+import org.apache.uima.fit.factory.TypeSystemDescriptionFactory;
 import org.apache.uima.fit.maven.util.Util;
 import org.apache.uima.resource.ResourceCreationSpecifier;
 import org.apache.uima.resource.ResourceInitializationException;
 import org.apache.uima.resource.ResourceSpecifier;
+import org.apache.uima.resource.metadata.Import;
+import org.apache.uima.resource.metadata.ProcessingResourceMetaData;
+import org.apache.uima.resource.metadata.TypeSystemDescription;
+import org.apache.uima.resource.metadata.impl.Import_impl;
 import org.codehaus.plexus.util.FileUtils;
 import org.sonatype.plexus.build.incremental.BuildContext;
 import org.xml.sax.SAXException;
@@ -60,9 +71,9 @@ public class GenerateDescriptorsMojo extends AbstractMojo {
   /**
    * Path where the generated resources are written.
    */
-  @Parameter(defaultValue="${project.build.directory}/classes", required=true)
+  @Parameter(defaultValue = "${project.build.directory}/classes", required = true)
   private File outputDirectory;
-  
+
   /**
    * Skip generation of META-INF/org.apache.uima.fit/components.txt
    */
@@ -75,6 +86,16 @@ public class GenerateDescriptorsMojo extends AbstractMojo {
   @Parameter(defaultValue = "${project.build.sourceEncoding}", required = true)
   private String encoding;
 
+  enum TypeSystemSerialization {
+    NONE, EMBEDDED, BY_NAME
+  }
+
+  /**
+   * How type systems are serialized in the generated descriptor
+   */
+  @Parameter(defaultValue = "NONE")
+  private TypeSystemSerialization typeSystemDescription;
+
   @Override
   public void execute() throws MojoExecutionException {
     // add the generated sources to the build
@@ -82,7 +103,7 @@ public class GenerateDescriptorsMojo extends AbstractMojo {
       outputDirectory.mkdirs();
       buildContext.refresh(outputDirectory);
     }
-    
+
     // Get the compiled classes from this project
     String[] files = FileUtils.getFilesFromExtension(project.getBuild().getOutputDirectory(),
             new String[] { "class" });
@@ -99,31 +120,47 @@ public class GenerateDescriptorsMojo extends AbstractMojo {
       String clazzName = clazzPath.replace(File.separator, ".");
       try {
         Class clazz = componentLoader.loadClass(clazzName);
-        
+
         // Do not generate descriptors for abstract classes, they cannot be instantiated.
         if (Modifier.isAbstract(clazz.getModifiers())) {
           continue;
         }
-        
+
         ResourceCreationSpecifier desc = null;
+        ProcessingResourceMetaData metadata = null;
         switch (Util.getType(componentLoader, clazz)) {
           case ANALYSIS_ENGINE:
-            desc = AnalysisEngineFactory.createEngineDescription(clazz);
+            AnalysisEngineDescription aeDesc = AnalysisEngineFactory.createEngineDescription(clazz);
+            metadata = aeDesc.getAnalysisEngineMetaData();
+            desc = aeDesc;
             break;
           case COLLECTION_READER:
-            desc = CollectionReaderFactory.createReaderDescription(clazz);
+            CollectionReaderDescription crDesc = CollectionReaderFactory
+                    .createReaderDescription(clazz);
+            metadata = crDesc.getCollectionReaderMetaData();
+            desc = crDesc;
           default:
             // Do nothing
         }
 
         if (desc != null) {
-          File out = new File(outputDirectory, clazzPath+".xml");
+          switch (typeSystemDescription) {
+            case BY_NAME:
+              addTypeSystemsByName(metadata);
+              break;
+            case EMBEDDED:
+              embedTypeSystems(metadata);
+            default:
+              // Do nothing
+          }
+
+          File out = new File(outputDirectory, clazzPath + ".xml");
           out.getParentFile().mkdirs();
           toXML(desc, out.getPath());
           countGenerated++;
-          
+
           // Remember component
-          componentsManifest.append("classpath*:").append(clazzPath+".xml").append('\n');
+          componentsManifest.append("classpath*:").append(clazzPath + ".xml").append('\n');
         }
       } catch (SAXException e) {
         getLog().warn("Cannot serialize descriptor for [" + clazzName + "]", e);
@@ -135,10 +172,10 @@ public class GenerateDescriptorsMojo extends AbstractMojo {
         getLog().warn("Cannot generate descriptor for [" + clazzName + "]", e);
       }
     }
-    
+
     getLog().info(
             "Generated " + countGenerated + " descriptor" + (countGenerated != 1 ? "s." : "."));
-    
+
     // Write META-INF/org.apache.uima.fit/components.txt unless skipped and unless there are no
     // components
     if (!skipComponentsManifest && componentsManifest.length() > 0) {
@@ -150,6 +187,51 @@ public class GenerateDescriptorsMojo extends AbstractMojo {
         throw new MojoExecutionException("Cannot write components manifest to [" + path + "]"
                 + ExceptionUtils.getRootCauseMessage(e), e);
       }
+    }
+  }
+
+  private void addTypeSystemsByName(ProcessingResourceMetaData metadata)
+          throws ResourceInitializationException {
+    ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+    Thread.currentThread().setContextClassLoader(componentLoader);
+    try {
+      TypeSystemDescriptionFactory.forceTypeDescriptorsScan();
+      String[] descPaths = TypeSystemDescriptionFactory.scanTypeDescriptors();
+
+      List<Import> imports = new ArrayList<>();
+
+      for (String descPath : descPaths) {
+        try {
+          URL jarUrl = new URL(descPath);
+          final JarURLConnection connection = (JarURLConnection) jarUrl.openConnection();
+          String path = connection.getJarEntry().getName();
+
+          // Remove the .xml extension
+          String name = path.substring(0, (path.length() - 4)).replace('/', '.');
+
+          Import imp = new Import_impl();
+          imp.setName(name);
+          imports.add(imp);
+        } catch (Exception e) {
+          getLog().error("Cannot add import statement for descriptor " + descPath, e);
+        }
+      }
+      metadata.getTypeSystem().setImports(imports.toArray(new Import[imports.size()]));
+    } finally {
+      Thread.currentThread().setContextClassLoader(classLoader);
+    }
+  }
+
+  private void embedTypeSystems(ProcessingResourceMetaData metadata)
+          throws ResourceInitializationException {
+    ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+    Thread.currentThread().setContextClassLoader(componentLoader);
+    try {
+      TypeSystemDescriptionFactory.forceTypeDescriptorsScan();
+      TypeSystemDescription tsDesc = TypeSystemDescriptionFactory.createTypeSystemDescription();
+      metadata.setTypeSystem(tsDesc);
+    } finally {
+      Thread.currentThread().setContextClassLoader(classLoader);
     }
   }
 
