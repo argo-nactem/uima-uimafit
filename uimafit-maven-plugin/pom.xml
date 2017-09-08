@@ -18,6 +18,7 @@
 		<version>2.3.0</version>
 		<relativePath>../uimafit-parent</relativePath>
 	</parent>
+	<groupId>uk.ac.nactem.argo</groupId>
 	<artifactId>uimafit-maven-plugin</artifactId>
 	<version>2.3.0-NACTEM-1</version>
 	<name>Apache UIMA uimaFIT - Maven Plugin</name>
